@@ -1,20 +1,21 @@
-import { S3Client } from '@aws-sdk/client-s3';
+import { STSClient } from '@aws-sdk/client-sts';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 
-import { S3Service } from './s3.service';
+import { TemplatesModule } from '../templates/templates.module';
+import { DocumentStoreService } from './document-store.service';
 
 @Module({
-  imports: [ConfigModule],
+  imports: [ConfigModule, TemplatesModule],
   providers: [
     {
-      provide: S3Client,
+      provide: STSClient,
       inject: [ConfigService],
       useFactory: (config: ConfigService) =>
-        new S3Client({ region: config.get<string>('s3.region') }),
+        new STSClient({ region: config.get<string>('aws.region') }),
     },
-    S3Service,
+    DocumentStoreService,
   ],
-  exports: [S3Service],
+  exports: [DocumentStoreService],
 })
 export class StorageModule {}

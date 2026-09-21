@@ -1,136 +1,110 @@
 # CLAUDE.md
 
-Conventions for this service. Read this before making any change.
+Conventions for the PDF converter. Read this before making any change.
 
 ## What this service is
 
-`orders-service` — a NestJS REST API that owns merchant orders.
+High-volume document-to-PDF conversion, targeting ~1M documents/day.
 
-- **MySQL (TypeORM)** holds authoritative order state. Anything transactional or
-  money-related lives here.
-- **MongoDB (Mongoose)** holds the append-only audit event log. Never authoritative,
-  never read inside a business decision.
-- **SQS** delivers order lifecycle events (`order.paid`) from the payments service.
-- **S3** stores merchant receipt documents. Documents are uploaded and downloaded via
-  presigned URLs; file bytes never pass through this service.
+- **MySQL** holds `conversion_jobs` — one row per document, owning the state machine.
+- **MongoDB** holds the source documents. The worker fetches its own payload.
+- **SQS** carries one message per document. Two queues: batch and urgent.
+- **S3** holds HTML templates and the rendered PDFs.
+- **Chromium** (Playwright) renders HTML to PDF.
+
+Word templates are converted to HTML **once, at onboarding**, by a separate service.
+LibreOffice must never appear in the per-document render path — that decision is what
+makes the cost model work.
 
 ## Commands
 
 ```bash
-npm ci                 # install
-npm run build          # nest build
-npm run lint           # eslint - must pass with zero errors
-npm run typecheck      # tsc --noEmit
-npm test               # jest unit tests - must pass
-npm run test:cov       # coverage
+npm ci
+npm run lint          # must pass with zero errors
+npm run typecheck     # tsc --noEmit
+npm test              # jest
+npm run build         # nest build
 ```
 
-Run `npm run lint`, `npm run typecheck` and `npm test` before finishing any change.
-All three pass on a clean checkout — if one fails, you broke it.
-
-There is no database in the test environment. Unit tests mock the TypeORM repository,
-the Mongoose model, the SQS client and the S3 client. Never write a unit test that
-needs a live MySQL, Mongo, SQS or S3.
+All four pass on a clean checkout. Tests require no MySQL, Mongo, S3, SQS or real
+Chromium — everything external is mocked or behind a port.
 
 ## Layout
 
 ```
 src/
-  config/configuration.ts          typed config, read via ConfigService
-  modules/
-    orders/                        MySQL - the core domain
-      orders.controller.ts         HTTP only: validate, delegate, shape
-      orders.service.ts            all business logic
-      orders.service.spec.ts
-      dto/                         class-validator DTOs
-      entities/order.entity.ts     TypeORM entity
-    audit/                         Mongo - append-only event log
-      audit.service.ts
-      schemas/audit-event.schema.ts
-    health/
-  queue/
-    order-events.consumer.ts       SQS polling consumer
-    queue.module.ts                provides SQSClient
-  storage/
-    s3.service.ts                  presigned URLs + put/delete
-    storage.module.ts              provides S3Client
+  config/configuration.ts      typed config; the only place process.env is read
+  jobs/                        conversion_jobs entity + state transitions
+  dispatcher/                  claim loop, SQS fan-out, deterministic output key
+  render/
+    browser.port.ts            the interface PdfRenderer depends on
+    chromium.factory.ts        the real Playwright implementation
+    pdf-renderer.service.ts    browser reuse, recycling, timeouts
+  templates/                   compiled-template cache, keyed by id + version
+  storage/                     S3 writer, default bucket or customer cross-account
+  payload/                     Mongo document fetch
+  worker/                      orchestration and the failure split
+  migrations/
 ```
 
-## Conventions
+## The rules that matter
 
-**General**
-- Business logic goes in services. Controllers validate input, call one service
-  method, and shape the response. No logic in controllers.
-- All request bodies are `class-validator` DTOs. The global `ValidationPipe` runs with
-  `whitelist` and `forbidNonWhitelisted`, so any field not on the DTO is rejected.
-- Config is read through `ConfigService` with a typed key (`config.get<string>('s3.documentsBucket')`).
-  Never touch `process.env` outside `src/config/configuration.ts`.
-- Errors are Nest HTTP exceptions: `NotFoundException`, `ConflictException`,
-  `BadRequestException`. Never return `null` to signal failure. Never catch an error
-  just to make it go away — the one deliberate exception is `AuditService.record`,
-  documented below.
-- `@typescript-eslint/no-explicit-any` and `no-floating-promises` are errors, not
-  warnings. Every promise is awaited or explicitly voided.
-- Logging uses the Nest `Logger` with the class name as context. Never log receipts,
-  presigned URLs, credentials or full order payloads.
+These encode decisions that are expensive to get wrong. Changing any of them needs a
+reason stated in the PR.
 
-**MySQL / TypeORM**
-- Entities live in `modules/<feature>/entities/`. Index every column used in a `where`
-  clause — see `Order.merchantId` and `Order.externalRef`.
-- `synchronize` is `false`. A schema change needs a migration, and a migration must be
-  called out loudly in the PR body.
-- Money is stored in integer cents (`totalCents`), never a float.
-- `externalRef` is the idempotency key for order creation. Creating an order with a
-  duplicate `externalRef` is a `ConflictException`, not a second row.
+**Idempotency comes from the output key.** `outputKey()` derives the S3 key from the
+job: org, batch, job id, template version. SQS is at-least-once, so messages will be
+redelivered; a deterministic key means the duplicate overwrites the same object.
+Never generate a key from a timestamp, a UUID, or anything else created at render
+time — that turns a retry into a duplicate document.
 
-**MongoDB / Mongoose**
-- Mongo is for audit events only. Never move authoritative state into it, and never
-  read from it to make a business decision.
-- Schemas live in `modules/<feature>/schemas/` and use `@Schema({ timestamps: true })`.
-- Every query that filters or sorts needs a matching index — see the compound
-  `{ merchantId: 1, occurredAt: -1 }` index on `AuditEvent`.
-- Always bound a `find`. `findRecentForMerchant` caps the limit at 200; follow that
-  pattern rather than returning an unbounded collection.
-- `AuditService.record` deliberately swallows and logs its errors. A failed audit write
-  must never fail the operation being audited. Do not "fix" this by rethrowing, and do
-  not copy this pattern anywhere else.
+**Claim by UPDATE-then-SELECT, never SELECT-then-UPDATE.** `JobsService.claimBatch`
+updates first and reads back what it claimed. The other order lets two dispatchers
+claim the same rows. There is a test asserting the call order; do not relax it.
 
-**SQS**
-- Handlers must be idempotent. SQS is at-least-once, so the same message will arrive
-  twice. `OrdersService.markPaid` returns the existing order unchanged when it is
-  already paid — that is the pattern to follow.
-- Delete a message only after the handler succeeds. On failure, leave it on the queue
-  so it is retried and eventually dead-lettered. Never delete a message in a `catch`.
-- One failing message must not stop the batch.
+**The dispatcher holds one chunk at a time.** The claim loop awaits each chunk's
+sends before claiming the next. That await is backpressure — removing it reintroduces
+unbounded memory while looking like it still streams. The dispatcher moves ids only;
+it must never load Mongo payloads.
 
-**S3**
-- Large or binary payloads move by presigned URL, never through this service.
-- Keys are namespaced `<type>/<merchantId>/<entityId>.<ext>` — never put a raw
-  user-supplied string in a key.
-- Verify the entity exists before signing a URL for it. Signing first and checking
-  later leaks the existence of objects.
-- Presigned URLs default to 15 minutes. Do not raise this without saying why.
+**Reuse the browser, recycle on a counter.** Launching Chromium costs 1–3s, rendering
+in a warm browser 200–500ms. `PdfRendererService` launches once and recycles every
+`BROWSER_RECYCLE_AFTER` renders because Chromium leaks. A failed render discards the
+browser — it may be wedged.
+
+**Render depends on `BrowserPort`, not Playwright.** That is what keeps tests fast and
+keeps the Lambda-vs-ECS choice open. New render code goes behind the port.
+
+**Permanent vs retryable failures are different.** Throw `PermanentJobError` for
+anything that will fail identically on retry — missing document, missing template,
+malformed data. Everything else is retryable. Retrying a permanent failure burns three
+renders to reach the same conclusion.
+
+**Never delete an SQS message in an error path.** `WorkerService.handle` rethrows on
+failure so the caller leaves the message on the queue to be retried and eventually
+dead-lettered.
+
+**A customer bucket failure falls back, it does not fail the job.** `DocumentStore`
+writes to the default bucket and returns `degraded: true`. A customer's broken role
+must never mean a lost document or an infinite retry.
+
+**Batch completion is a query, not a counter.** `batchProgress()` counts rows. Do not
+add a separate counter store — two mechanisms tracking one fact will drift.
 
 ## Testing
 
-- Jest, unit tests colocated as `*.spec.ts` next to the code.
-- Mock external I/O: the TypeORM repository via `getRepositoryToken`, the Mongoose
-  model via `getModelToken`, and the `SQSClient` / `S3Client` via a plain
-  `{ send: jest.fn() }`. Never mock the unit under test.
-- Every service method needs: the happy path, one failure path, and one edge case
-  (not found, empty result, duplicate, boundary value).
-- A test must fail if the implementation is removed. No assertion-free tests.
-- Follow the existing specs as templates — `orders.service.spec.ts` for repository
-  mocking, `audit.service.spec.ts` for the Mongoose query-chain mock,
-  `order-events.consumer.spec.ts` for SQS.
+- Jest, specs colocated as `*.spec.ts`.
+- Mock the repository via `getRepositoryToken`, the AWS clients via `{ send: jest.fn() }`,
+  and the browser via a fake implementing `BrowserPort`.
+- Every service method needs a happy path, a failure path and an edge case.
+- A test must fail if the implementation is removed.
+- Concurrency rules above need tests asserting the mechanism, not just the result.
 
 ## Never
 
-- Never modify `.github/`, `.claude/`, `.env*`, or CI configuration.
-- Never add a dependency the ticket did not ask for.
-- Never set `synchronize: true`.
-- Never weaken, skip or delete an existing test to get a green run. If an existing
-  test genuinely must change, change it and flag it prominently in the PR.
-- Never delete an SQS message in an error path.
-- Never log or persist a presigned URL.
-- Never refactor, reformat or upgrade anything outside the ticket's scope.
+- Never modify `.github/`, `.env*`, or CI config.
+- Never set `synchronize: true`. Schema changes are migrations, flagged in the PR.
+- Never read `process.env` outside `src/config/configuration.ts`.
+- Never weaken, skip or delete a test to get a green run.
+- Never log a presigned URL, customer credentials, or document contents.
+- Never add LibreOffice or Word handling to the render path.

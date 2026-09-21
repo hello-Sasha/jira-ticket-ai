@@ -12,7 +12,11 @@
     "baseUrl": "./",
     "incremental": true,
     "skipLibCheck": true,
+    "strict": true,
     "strictNullChecks": true,
+    // TypeORM assigns entity columns via decorators, which the compiler
+    // cannot see. Off for the whole project rather than `!` on every column.
+    "strictPropertyInitialization": false,
     "noImplicitAny": true,
     "strictBindCallApply": true,
     "forceConsistentCasingInFileNames": true,

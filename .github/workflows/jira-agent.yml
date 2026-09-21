@@ -1,0 +1,227 @@
+name: Jira AI Agent
+
+on:
+  repository_dispatch:
+    types: [jira-task]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: jira-${{ github.event.client_payload.key }}
+  cancel-in-progress: false
+
+env:
+  KEY: ${{ github.event.client_payload.key }}
+  SUMMARY: ${{ github.event.client_payload.summary }}
+  DESC: ${{ github.event.client_payload.description }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+  JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+  JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+  SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+jobs:
+  # -------------------------------------------------------------------
+  # 1. TRIAGE - cheap model reads the ticket + repo and rates complexity
+  # -------------------------------------------------------------------
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      complexity: ${{ steps.route.outputs.complexity }}
+      model: ${{ steps.route.outputs.model }}
+      max_turns: ${{ steps.route.outputs.max_turns }}
+      reason: ${{ steps.route.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Write ticket to file
+        run: |
+          mkdir -p .agent
+          printf '# %s: %s\n\n%s\n' "$KEY" "$SUMMARY" "$DESC" > .agent/ticket.md
+
+      - name: Run triage (Haiku)
+        run: |
+          claude -p "$(cat .github/agent/triage-prompt.md)" \
+            --model haiku \
+            --max-turns 15 \
+            --allowedTools "Read,Glob,Grep,Write" \
+            --output-format json > .agent/triage-run.json || true
+
+      - name: Pick model from complexity
+        id: route
+        run: |
+          if [ -f .agent/triage.json ]; then
+            COMPLEXITY=$(jq -r '.complexity // "unclear"' .agent/triage.json)
+            REASON=$(jq -r '.reason // ""' .agent/triage.json)
+          else
+            COMPLEXITY="unclear"
+            REASON="Triage produced no result - check the workflow run."
+          fi
+
+          # ---------- ROUTING TABLE - edit here ----------
+          case "$COMPLEXITY" in
+            simple)  MODEL="haiku";  TURNS=30 ;;
+            medium)  MODEL="sonnet"; TURNS=50 ;;
+            complex) MODEL="opus";   TURNS=80 ;;
+            *)       MODEL="none";   TURNS=0; COMPLEXITY="unclear" ;;
+          esac
+          # -----------------------------------------------
+
+          echo "complexity=$COMPLEXITY" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "max_turns=$TURNS" >> "$GITHUB_OUTPUT"
+          {
+            echo "reason<<AGENT_EOF"
+            echo "$REASON"
+            echo "AGENT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Report triage
+        env:
+          COMPLEXITY: ${{ steps.route.outputs.complexity }}
+          MODEL: ${{ steps.route.outputs.model }}
+          REASON: ${{ steps.route.outputs.reason }}
+        run: |
+          if [ "$COMPLEXITY" = "unclear" ]; then
+            QUESTIONS=$(jq -r '(.questions // []) | map("- " + .) | join("\n")' .agent/triage.json 2>/dev/null || echo "")
+            bash .github/agent/notify.sh "AI agent skipped $KEY - the ticket is not clear enough.
+
+          $REASON
+
+          $QUESTIONS
+
+          Answer these in the ticket, remove and re-add the ai-agent label to retry."
+          else
+            bash .github/agent/notify.sh "Triage for $KEY: $COMPLEXITY -> running on $MODEL. $REASON"
+          fi
+
+  # -------------------------------------------------------------------
+  # 2. IMPLEMENT - routed model runs planner -> implementer -> reviewer
+  # -------------------------------------------------------------------
+  implement:
+    needs: triage
+    if: needs.triage.outputs.complexity != 'unclear'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MODEL: ${{ needs.triage.outputs.model }}
+      MAX_TURNS: ${{ needs.triage.outputs.max_turns }}
+      COMPLEXITY: ${{ needs.triage.outputs.complexity }}
+      TRIAGE_REASON: ${{ needs.triage.outputs.reason }}
+      GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Prepare branch and ticket file
+        run: |
+          git checkout -b "ai/$KEY"
+          echo ".agent/" >> .git/info/exclude
+          mkdir -p .agent
+          printf '# %s: %s\n\n%s\n' "$KEY" "$SUMMARY" "$DESC" > .agent/ticket.md
+
+      - name: Run agents
+        run: |
+          claude -p "$(cat .github/agent/implement-prompt.md)" \
+            --model "$MODEL" \
+            --max-turns "$MAX_TURNS" \
+            --allowedTools "Read,Edit,Write,Glob,Grep,Task,Agent,Bash(npm run lint:*),Bash(npm run test:*),Bash(npm test:*),Bash(npm run build:*),Bash(npx tsc:*),Bash(git diff:*),Bash(git status:*)" \
+            --output-format json > .agent/run.json || echo "Agent exited non-zero - continuing to report."
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify when nothing changed
+        if: steps.changes.outputs.has_changes == 'false'
+        run: |
+          bash .github/agent/notify.sh "AI agent finished $KEY ($MODEL) with no code changes. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Commit and push
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          git config user.name "ai-agent"
+          git config user.email "ai-agent@users.noreply.github.com"
+          git add -A
+          git commit -m "$KEY: $SUMMARY
+
+          Co-Authored-By: Claude <noreply@anthropic.com>"
+          git push -u origin "ai/$KEY"
+
+      - name: Open PR
+        if: steps.changes.outputs.has_changes == 'true'
+        id: pr
+        run: |
+          COST=$(jq -r '.total_cost_usd // "n/a"' .agent/run.json 2>/dev/null || echo "n/a")
+
+          if grep -q '^VERDICT: PASS' .agent/review.md 2>/dev/null; then
+            DRAFT=""
+            STATUS="ready for review"
+          else
+            DRAFT="--draft"
+            STATUS="DRAFT - the reviewer agent did not pass it"
+          fi
+
+          {
+            echo "Jira: $JIRA_BASE_URL/browse/$KEY"
+            echo
+            echo "**Triage:** $COMPLEXITY -> \`$MODEL\` - $TRIAGE_REASON"
+            echo "**Agent cost:** \$$COST"
+            echo
+            echo "## Plan"
+            cat .agent/plan.md 2>/dev/null || echo "_no plan written_"
+            echo
+            echo "## Review"
+            cat .agent/review.md 2>/dev/null || echo "_no review written_"
+            echo
+            echo "---"
+            echo "Generated with [Claude Code](https://claude.com/claude-code)"
+          } > .agent/pr-body.md
+
+          PR_URL=$(gh pr create \
+            --title "$KEY: $SUMMARY" \
+            --body-file .agent/pr-body.md \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "ai/$KEY" \
+            $DRAFT)
+
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "cost=$COST" >> "$GITHUB_OUTPUT"
+
+      - name: Notify PR
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          bash .github/agent/notify.sh "PR for $KEY ($COMPLEXITY / $MODEL, \$${{ steps.pr.outputs.cost }}) - ${{ steps.pr.outputs.status }}: ${{ steps.pr.outputs.url }}"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          bash .github/agent/notify.sh "AI agent run for $KEY FAILED: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
